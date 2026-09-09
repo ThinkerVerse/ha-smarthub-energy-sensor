@@ -174,15 +174,78 @@ class SmartHubAPI:
 
         return parsed_data
 
+    def resolve_meter_series(self, entry: Dict[str, Any]) -> Dict[ParseType, str]:
+        """
+        Map an entry's meters onto the series IDs that carry each flow direction.
+
+        Both the "USAGE" and "COST" entries describe the same physical meters, so
+        the same mapping is used to pick the right series out of either one.
+        """
+        series_ids = {ParseType.FORWARD: "", ParseType.NET: "", ParseType.RETURN: ""}
+
+        meters = entry.get("meters", [])
+        if len(meters) > 2:
+          _LOGGER.warning("More then 2 meters in usage data: %s", meters)
+
+        for meter in meters:
+          # assume forward is default if not present
+          flow_direction = meter.get("flowDirection", ParseType.FORWARD)
+          match flow_direction:
+            case ParseType.FORWARD | ParseType.TOTAL:
+              series_ids[ParseType.FORWARD] = meter["seriesId"]
+            case ParseType.NET:
+              series_ids[ParseType.NET] = meter["seriesId"]
+            case ParseType.RETURN:
+              series_ids[ParseType.RETURN] = meter["seriesId"]
+            case _:
+              _LOGGER.warning("Unknown flow direction in meter: %s", meter)
+
+        return series_ids
+
+    def parse_entry(self, entry: Dict[str, Any], parsed_response: Dict[str, Any], key: str) -> None:
+        """
+        Parse a single ELECTRIC entry into `parsed_response` under `key`.
+
+        `key` is "USAGE" for consumption (kWh) or "COST" for the matching
+        currency amounts. Returned energy / bill credits land in `<key>_RETURN`.
+        """
+        series_ids = self.resolve_meter_series(entry)
+        forward_series = series_ids[ParseType.FORWARD]
+        net_series = series_ids[ParseType.NET]
+        return_series = series_ids[ParseType.RETURN]
+
+        return_key = f"{key}_RETURN"
+
+        for serie in entry.get("series", []):
+            if serie.get("name", "") == return_series:
+                series_data = serie.get("data", [])
+                parsed_response[return_key] = self.parse_usage_series(series_data, ParseType.RETURN)
+                _LOGGER.debug("Parsed %d items for %s history", len(parsed_response[return_key]), return_key)
+
+            # If there is a NetMeter, use that for both Return and Usage (as it combines both).
+            # NOTE - there must always be a FORWARD or NET meter - or the entry is not being returned.
+            if serie.get("name", "") == (net_series if net_series != "" else forward_series):
+                parsed_response[METER_NAME] = serie.get("name")
+
+                series_data = serie.get("data", [])
+                parsed_response[key] = self.parse_usage_series(series_data)
+                _LOGGER.debug("Parsed %d items for %s history", len(parsed_response[key]), key)
+
+                if net_series != "":
+                  parsed_response[return_key] = self.parse_usage_series(series_data, ParseType.NET)
+                  _LOGGER.debug("Parsed %d items for %s history", len(parsed_response[return_key]), return_key)
+
     def parse_usage(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Parse the JSON data and extract the last data point for usage.
+        Parse the JSON data and extract the usage and cost series.
 
         Args:
             data: The JSON data as a Python dictionary.
 
         Returns:
-            A dictionary containing the "USAGE" with a list of parsed data and metadata, or an empty dictionary if not found.
+            A dictionary containing "USAGE" (and "COST" where the provider
+            returns it) with a list of parsed data and metadata, or an empty
+            dictionary if not found.
 
         Raises:
             SmartHubDataError: If there's an error parsing the data.
@@ -200,49 +263,11 @@ class SmartHubAPI:
               _LOGGER.debug(data)
 
             for entry in electric_data:
-                # Find the entry with type "USAGE"
-                if entry.get("type","") == "USAGE":
-                    _LOGGER.debug("Usage: %s", entry)
-
-                    meters = entry.get("meters", [])
-                    forward_series = ""
-                    net_series = ""
-                    return_series = ""
-                    if len(meters) > 2:
-                      _LOGGER.warning("More then 2 meters in usage data: %s", meters)
-                    for meter in meters:
-                      # assume forward is default if not present
-                      flow_direction = meter.get("flowDirection", ParseType.FORWARD)
-                      match flow_direction:
-                        case ParseType.FORWARD | ParseType.TOTAL:
-                          forward_series = meter["seriesId"]
-                        case ParseType.NET:
-                          net_series = meter["seriesId"]
-                        case ParseType.RETURN:
-                          return_series = meter["seriesId"]
-                        case _:
-                          _LOGGER.warning("Unknown flow direction in meter: %s", meter)
-
-                    series = entry.get("series", [])
-                    for serie in series:
-                        if serie.get("name", "") == return_series:
-                            usage_data = serie.get("data", [])
-                            parsed_response["USAGE_RETURN"] = self.parse_usage_series(usage_data, ParseType.RETURN)
-                            _LOGGER.debug("Parsed %d items for USAGE_RETURN history", len(parsed_response["USAGE_RETURN"]))
-
-                        # If there is a NetMeter, use that for both Return and Usage (as it combines both).
-                        # NOTE - there must always be a FORWARD or NET meter - or the "USAGE" is not being returned.
-                        if serie.get("name", "") == (net_series if net_series != "" else forward_series):
-                            parsed_response[METER_NAME] = serie.get("name")
-
-                            # Extract the last data point in the "data" array
-                            usage_data = serie.get("data", [])
-                            parsed_response["USAGE"] = self.parse_usage_series(usage_data)
-                            _LOGGER.debug("Parsed %d items for USAGE history", len(parsed_response["USAGE"]))
-
-                            if net_series != "":
-                              parsed_response["USAGE_RETURN"] = self.parse_usage_series(usage_data, ParseType.NET)
-                              _LOGGER.debug("Parsed %d items for USAGE_RETURN history", len(parsed_response["USAGE_RETURN"]))
+                entry_type = entry.get("type", "")
+                # "COST" is optional - only some providers return it alongside "USAGE"
+                if entry_type in ("USAGE", "COST"):
+                    _LOGGER.debug("%s: %s", entry_type.title(), entry)
+                    self.parse_entry(entry, parsed_response, entry_type)
                 else:
                     _LOGGER.debug("Unknown Usage: %s", entry)
 

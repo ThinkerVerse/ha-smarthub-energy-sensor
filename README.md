@@ -95,12 +95,22 @@ Once configured, your SmartHub energy sensor will automatically appear in Home A
    Note: there will be multiple entries, 1 entity (monthly), and 2 Statistics (daily, hourly)- select one of the statistics which provide historical usage aligned with the your actual energy usage.
 4. The sensor will now provide data to your Energy Dashboard
 
+#### Energy Costs
+
+Some SmartHub providers return the dollar cost of each reading alongside the usage. Where they do, the integration imports it as an additional `cost` statistic that lines up hour-for-hour with the usage statistic.
+
+In the Energy dashboard, when adding your grid consumption, choose **"Use an entity with a total cost"** (rather than a static price per kWh) and select the matching SmartHub cost statistic. Your dashboard then shows the same figures your provider bills you, including any tiered or time-of-use rates that a fixed price per kWh cannot express.
+
+If your provider does not return cost data, no cost statistic is created and you can continue to set a price per kWh manually.
+
 #### Solar or Net Metering
 Different energy providers have different solar / net metering configurations. Your energy provider might provide data on how much energy you return to the grid, how much energy you consume, or a combination of both.
 
 The integration should automatically determine the appropriate option, and provide an additional "return" hourly and daily statistic.
 
 In the Energy dashboard set the Grid Consumption entry to the "usage" statistic, and the Return to Grid to the "return" statistic.
+
+Where the provider also returns cost data, a "compensation" statistic records the credit for energy you return, and can be selected as the compensation entity for your Return to Grid entry.
 
 ### Sensor Details
 
@@ -199,6 +209,8 @@ Contributions are welcome! Please follow these guidelines:
 - Data availability depends on your energy provider's SmartHub implementation
 - Update frequency is limited by the provider's data refresh rate
 - Currently supports electricity usage only (no gas or other utilities)
+- Cost data is only available if your provider returns it; not all SmartHub deployments do
+- Statistics are hourly at finest resolution - Home Assistant does not accept sub-hourly external statistics, so any 15-minute reads your provider returns are summed into the hour
 - Requires active SmartHub portal access
 
 

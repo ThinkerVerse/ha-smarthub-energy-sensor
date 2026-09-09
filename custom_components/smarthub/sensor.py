@@ -179,34 +179,54 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
     # utility dashboards.
     async def _insert_statistics(self, location, aggregation: Aggregation):
         """Retrieve energy usage data asynchronously with retry logic. Always backfills the data overwriting the history based on the collection window."""
-        consumption_statistic_id = f"{DOMAIN}:smarthub_energy_sensor{aggregation.suffix}_{self.account_id}_{location.id}"
-        return_statistic_id = f"{DOMAIN}:smarthub_energy_return_sensor{aggregation.suffix}_{self.account_id}_{location.id}"
+        # Each series SmartHub returns is imported as its own external statistic.
+        # USAGE is always present; the others depend on the provider - RETURN
+        # needs a net/return meter, and COST/COST_RETURN only appear when the
+        # provider reports currency alongside consumption.
+        # (key, statistic_id, name, is_energy)
+        series_specs = [
+            (
+                "USAGE",
+                f"{DOMAIN}:smarthub_energy_sensor{aggregation.suffix}_{self.account_id}_{location.id}",
+                "Usage",
+                True,
+            ),
+            (
+                "USAGE_RETURN",
+                f"{DOMAIN}:smarthub_energy_return_sensor{aggregation.suffix}_{self.account_id}_{location.id}",
+                "Return",
+                True,
+            ),
+            (
+                "COST",
+                f"{DOMAIN}:smarthub_energy_cost{aggregation.suffix}_{self.account_id}_{location.id}",
+                "Cost",
+                False,
+            ),
+            (
+                "COST_RETURN",
+                f"{DOMAIN}:smarthub_energy_compensation{aggregation.suffix}_{self.account_id}_{location.id}",
+                "Compensation",
+                False,
+            ),
+        ]
 
-        consumption_unit_class = (
-            EnergyConverter.UNIT_CLASS
-        )
-        consumption_unit = (
-            UnitOfEnergy.KILO_WATT_HOUR
-        )
-        consumption_metadata = StatisticMetaData(
-            mean_type=StatisticMeanType.NONE,
-            has_sum=True,
-            name=f"{location.provider} SmartHub Energy {aggregation.label} Usage - {self.account_id} - {location.description}",
-            source=DOMAIN,
-            statistic_id=consumption_statistic_id,
-            unit_class=consumption_unit_class, # required in 2025.11
-            unit_of_measurement=consumption_unit,
-        )
+        # The consumption series drives the collection window for every series.
+        consumption_statistic_id = series_specs[0][1]
 
-        return_metadata = StatisticMetaData(
-            mean_type=StatisticMeanType.NONE,
-            has_sum=True,
-            name=f"{location.provider} SmartHub Energy {aggregation.label} Return - {self.account_id} - {location.description}",
-            source=DOMAIN,
-            statistic_id=return_statistic_id,
-            unit_class=consumption_unit_class, # required in 2025.11
-            unit_of_measurement=consumption_unit,
-        )
+        metadata = {}
+        for key, statistic_id, label, is_energy in series_specs:
+            metadata[key] = StatisticMetaData(
+                mean_type=StatisticMeanType.NONE,
+                has_sum=True,
+                name=f"{location.provider} SmartHub Energy {aggregation.label} {label} - {self.account_id} - {location.description}",
+                source=DOMAIN,
+                statistic_id=statistic_id,
+                # Cost statistics carry no unit - the Energy dashboard renders
+                # them using the currency configured in Home Assistant.
+                unit_class=EnergyConverter.UNIT_CLASS if is_energy else None,
+                unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR if is_energy else None,
+            )
 
         last_stat = await get_instance(self.hass).async_add_executor_job(
             get_last_statistics, self.hass, 1, consumption_statistic_id, True, set()
@@ -216,8 +236,7 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
         smarthub_data = {}
         if not last_stat:
             _LOGGER.debug("Updating %s statistic for the first time", aggregation.label)
-            consumption_sum = 0.0
-            return_sum      = 0.0
+            sums = {key: 0.0 for key, *_ in series_specs}
             last_stats_time = None
 
             # Initialize with last HISTORICAL_IMPORT_DAYS (usually 90) days of data
@@ -282,10 +301,7 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
                     self.hass,
                     start,
                     end,
-                    {
-                        consumption_statistic_id,
-                        return_statistic_id,
-                    },
+                    {statistic_id for _, statistic_id, _, _ in series_specs},
                     aggregation.period,
                     None,
                     {"sum"},
@@ -306,66 +322,50 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
                     return float(records[0]["sum"])
                 return 0.0
 
-            consumption_sum = _safe_get_sum(stats.get(consumption_statistic_id, []))
-            return_sum    = _safe_get_sum(stats.get(return_statistic_id, []))
+            sums = {
+                key: _safe_get_sum(stats.get(statistic_id, []))
+                for key, statistic_id, _, _ in series_specs
+            }
             last_stats_time = stats[consumption_statistic_id][0]["start"]
 
             _LOGGER.info(f"Updating %s statistics since %s", aggregation.label, last_stats_time)
 
-        consumption_statistics = []
-        return_statistics      = []
+        statistics = {}
+        for key, statistic_id, label, is_energy in series_specs:
+            running_sum = sums[key]
+            series_statistics = []
 
-        for cost_read in smarthub_data.get("USAGE", []):
-            start = cost_read.get("reading_time")
-            if last_stats_time is not None and start.timestamp() <= last_stats_time:
-                continue
+            for read in smarthub_data.get(key, []):
+                start = read.get("reading_time")
+                if last_stats_time is not None and start.timestamp() <= last_stats_time:
+                    continue
 
-            consumption_state = max(0, cost_read.get("consumption"))
-            consumption_sum += consumption_state
+                state = max(0, read.get("consumption"))
+                running_sum += state
 
-            consumption_statistics.append(
-                StatisticData(
-                    start=start, state=consumption_state, sum=consumption_sum
+                series_statistics.append(
+                    StatisticData(start=start, state=state, sum=running_sum)
                 )
-            )
 
-        for return_read in smarthub_data.get("USAGE_RETURN", []):
-            start = return_read.get("reading_time")
-            if last_stats_time is not None and start.timestamp() <= last_stats_time:
-                continue
-
-            return_state = max(0, return_read.get("consumption"))
-            return_sum += return_state
-
-            return_statistics.append(
-                StatisticData(
-                    start=start, state=return_state, sum=return_sum
-                )
-            )
+            statistics[key] = series_statistics
 
         # If the location description is blank, use the meter name instead.
         if location.description == "":
-          consumption_metadata["name"]=f"{location.provider} SmartHub Energy {aggregation.label} Usage - {self.account_id} - {smarthub_data.get(METER_NAME, None)}"
-          return_metadata["name"]=f"{location.provider} SmartHub Energy {aggregation.label} Return - {self.account_id} - {smarthub_data.get(METER_NAME, None)}"
+          for key, statistic_id, label, is_energy in series_specs:
+            metadata[key]["name"] = f"{location.provider} SmartHub Energy {aggregation.label} {label} - {self.account_id} - {smarthub_data.get(METER_NAME, None)}"
 
-        _LOGGER.info(
-            "Adding %s statistics for %s",
-            len(consumption_statistics),
-            consumption_statistic_id,
-        )
-        async_add_external_statistics(
-            self.hass, consumption_metadata, consumption_statistics
-        )
+        for key, statistic_id, label, is_energy in series_specs:
+            # Consumption is always recorded; the rest only when the provider
+            # actually returned that series.
+            if key != "USAGE" and key not in smarthub_data:
+                continue
 
-        if "USAGE_RETURN" in smarthub_data:
-          _LOGGER.info(
-            "Adding %s return statistics for %s",
-            len(return_statistics),
-            return_statistic_id,
-          )
-          async_add_external_statistics(
-            self.hass, return_metadata, return_statistics
-          )
+            _LOGGER.info(
+                "Adding %s statistics for %s",
+                len(statistics[key]),
+                statistic_id,
+            )
+            async_add_external_statistics(self.hass, metadata[key], statistics[key])
 
 
 class SmartHubEnergySensor(CoordinatorEntity, SensorEntity):
