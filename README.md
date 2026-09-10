@@ -59,7 +59,7 @@ config/
 
 ### Requirements
 
-Version 2.1 and higher requires Home Assistant version 2025.11 and greater.
+Version 2.1 and higher requires Home Assistant version 2025.11 and greater. CI runs the test suite against both ends of that range - 2025.11 on Python 3.13, and the current release on Python 3.14.
 
 Before setting up the integration, you'll need to gather the following information from your SmartHub portal:
 
