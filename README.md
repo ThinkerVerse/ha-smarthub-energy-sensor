@@ -125,6 +125,30 @@ By default, the integration will poll the SmartHub API every 6 hours. You can ad
 
 **Note**: SmartHub data typically updates every 15-60 minutes, so setting a very low poll interval may not provide more frequent updates but will increase API calls.
 
+### Historical Import
+
+**Days of history to import** controls how far back the integration reaches on its first run. The default is 365 days and it can be set anywhere from 1 day to 10 years.
+
+You do not need to know how much history your provider keeps. The import walks backwards in 90-day chunks and stops as soon as a chunk comes back empty, so asking for more days than exist simply ends early. Chunking also keeps memory use flat - a single multi-year request would be hundreds of megabytes to parse, which matters on a Raspberry Pi.
+
+Setup is not held up by a deep import. The first refresh fetches only the opening chunk so the integration becomes available quickly, and anything beyond that is imported by a background task straight afterwards. Watch the log for `Continuing historical import` to follow its progress.
+
+Polling cadence is taken from the provider itself (`UsagePollingRequestInterval` and `UsagePollingExecutorMaxRuntime`), falling back to 5 seconds between retries and 5 minutes per request when those are unavailable.
+
+### Re-importing history later
+
+The first-run import only happens while no statistics exist yet. To pull more history afterwards, call the `smarthub.import_history` action:
+
+```yaml
+action: smarthub.import_history
+data:
+  days: 1825   # optional, defaults to the configured value
+```
+
+⚠️ **Delete the existing SmartHub statistics first** (Developer tools → Statistics), because every reading is rewritten from a zero baseline. Home Assistant does not rebase the running totals of statistics that already exist, so importing older data underneath them leaves the totals inconsistent.
+
+Pass `entry_id` to limit the import to one account when you have several configured.
+
 ## 🛠️ Troubleshooting
 
 ### Common Issues
@@ -211,6 +235,8 @@ Contributions are welcome! Please follow these guidelines:
 - Currently supports electricity usage only (no gas or other utilities)
 - Cost data is only available if your provider returns it; not all SmartHub deployments do
 - Statistics are hourly at finest resolution - Home Assistant does not accept sub-hourly external statistics, so any 15-minute reads your provider returns are summed into the hour
+- How far back history goes is set by your provider, not this integration; the import stops where their data stops
+- On the autumn daylight-saving changeover SmartHub reports 24 wall-clock hours for a 25-hour day, so one hour per year is missing from the imported series
 - Requires active SmartHub portal access
 
 

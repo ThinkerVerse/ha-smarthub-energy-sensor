@@ -9,12 +9,15 @@
           "account_id": "Account ID",
           "host": "SmartHub Host",
           "timezone": "Timezone for power company",
-          "mfa_totp": "MFA TOTP Seed"
+          "mfa_totp": "MFA TOTP Seed",
+          "poll_interval": "Polling interval (minutes)",
+          "history_days": "Days of history to import"
         },
         "data_description" : {
           "host": "e.g XXXXXX.smarthub.coop",
           "timezone": "Timezone for power company",
-          "mfa_totp": "MFA TOTP Seed - only required if using MFA"
+          "mfa_totp": "MFA TOTP Seed - only required if using MFA",
+          "history_days": "How far back to import on first run. The import stops early if your provider holds less than this."
         }
       }
     },

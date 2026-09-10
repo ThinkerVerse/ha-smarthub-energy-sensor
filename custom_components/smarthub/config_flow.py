@@ -12,8 +12,12 @@ from .const import (
   CONF_POLL_INTERVAL,
   CONF_TIMEZONE,
   CONF_MFA_TOTP,
+  CONF_HISTORY_DAYS,
   MIN_POLL_INTERVAL,
-  MAX_POLL_INTERVAL
+  MAX_POLL_INTERVAL,
+  HISTORICAL_IMPORT_DAYS,
+  MIN_HISTORY_DAYS,
+  MAX_HISTORY_DAYS
 )
 from .api import SmartHubAPI
 from .exceptions import SmartHubAuthenticationError, SmartHubConnectionError
@@ -88,6 +92,7 @@ class SmartHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                  )
                ),
                vol.Required(CONF_POLL_INTERVAL, default=DEFAULT_POLL_INTERVAL): vol.All(vol.Coerce(int), vol.Range(min=MIN_POLL_INTERVAL, max=MAX_POLL_INTERVAL)),
+               vol.Required(CONF_HISTORY_DAYS, default=HISTORICAL_IMPORT_DAYS): vol.All(vol.Coerce(int), vol.Range(min=MIN_HISTORY_DAYS, max=MAX_HISTORY_DAYS)),
             }
         )
 

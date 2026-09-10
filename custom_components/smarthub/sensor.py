@@ -1,6 +1,7 @@
 """SmartHub energy sensor platform."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -55,7 +56,9 @@ from .const import (
     ATTR_ACCOUNT_ID,
     ATTR_LOCATION_ID,
     LOCATION_KEY,
+    CONF_HISTORY_DAYS,
     HISTORICAL_IMPORT_DAYS,
+    HISTORY_CHUNK_DAYS,
     METER_NAME,
 )
 
@@ -114,9 +117,22 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
         )
         self.api = api
         self.account_id = config_entry.data.get('account_id','unknown')
+        self.history_days = config_entry.data.get(CONF_HISTORY_DAYS, HISTORICAL_IMPORT_DAYS)
+        # Set when a first run imported only its opening chunk, so setup can
+        # finish promptly and the rest of the history can be fetched after.
+        self.history_backfill_pending = False
+        # Statistics are rewritten from a zero baseline during a historical
+        # import. Serialise that against the scheduled refresh, which appends
+        # incremental rows to the same statistic ids.
+        self._statistics_lock = asyncio.Lock()
 
     async def _async_update_data(self) -> Dict[str, Any]:
         """Fetch data from the SmartHub API."""
+        async with self._statistics_lock:
+            return await self._async_update_data_locked()
+
+    async def _async_update_data_locked(self) -> Dict[str, Any]:
+        """Fetch data from the SmartHub API, holding the statistics lock."""
         try:
             _LOGGER.debug("Fetching data from SmartHub API")
 
@@ -174,10 +190,37 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"Unexpected error: {e}") from e
 
 
+    async def async_import_history(self, days: int) -> None:
+        """
+        Re-import `days` of history for every location on this account.
+
+        Each series is rewritten from a zero baseline, so any statistics already
+        covering the range should be deleted first - Home Assistant does not
+        rebase the running totals of rows that already exist.
+        """
+        async with self._statistics_lock:
+            locations = await self.api.get_service_locations()
+            _LOGGER.info(
+                "Importing %d days of history for %d location(s)", days, len(locations)
+            )
+
+            for location in locations:
+                for aggregation in (Aggregation.HOURLY, Aggregation.DAILY):
+                    await self._insert_statistics(
+                        location, aggregation, force_history_days=days
+                    )
+
+            self.history_backfill_pending = False
+
+        # Bring the entity state back in line with the freshly imported data.
+        # Refresh immediately rather than debouncing - the import was explicit.
+        # Outside the lock: the refresh takes it itself.
+        await self.async_refresh()
+
     # https://github.com/tronikos/opower/ was used as a model for how to populate
     # hourly metrics when access to realtime information is not possible via
     # utility dashboards.
-    async def _insert_statistics(self, location, aggregation: Aggregation):
+    async def _insert_statistics(self, location, aggregation: Aggregation, force_history_days: int | None = None):
         """Retrieve energy usage data asynchronously with retry logic. Always backfills the data overwriting the history based on the collection window."""
         # Each series SmartHub returns is imported as its own external statistic.
         # USAGE is always present; the others depend on the provider - RETURN
@@ -234,16 +277,31 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
         _LOGGER.debug("last_stat for %s: %s", aggregation.label, last_stat)
 
         smarthub_data = {}
-        if not last_stat:
-            _LOGGER.debug("Updating %s statistic for the first time", aggregation.label)
+        if force_history_days is not None or not last_stat:
+            if force_history_days is not None:
+                history_days = force_history_days
+            else:
+                # Config entry setup waits on the first refresh, so only the
+                # opening chunk is fetched inline. Anything deeper is handed to
+                # a background task once setup has finished.
+                history_days = min(self.history_days, HISTORY_CHUNK_DAYS)
+                if self.history_days > history_days:
+                    self.history_backfill_pending = True
+            _LOGGER.debug(
+                "Importing %d days of %s history", history_days, aggregation.label
+            )
             sums = {key: 0.0 for key, *_ in series_specs}
             last_stats_time = None
 
-            # Initialize with last HISTORICAL_IMPORT_DAYS (usually 90) days of data
-            start_datetime = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=HISTORICAL_IMPORT_DAYS)
-
-            # Load read data for use in populating statistics
-            smarthub_data = await self.api.get_energy_data(location=location, aggregation=aggregation, start_datetime=start_datetime)
+            # Fetched in chunks, oldest reading first, stopping at whatever the
+            # provider actually holds. Every reading is (re)written from a zero
+            # baseline, so this path assumes no statistics already exist for the
+            # range - see the import_history service documentation.
+            smarthub_data = await self.api.get_energy_data_history(
+                location=location,
+                aggregation=aggregation,
+                max_days=history_days,
+            )
         else:
             _LOGGER.debug("Checking if data migration is needed for %s...", aggregation.label)
             migrated = False
@@ -328,7 +386,7 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
             }
             last_stats_time = stats[consumption_statistic_id][0]["start"]
 
-            _LOGGER.info(f"Updating %s statistics since %s", aggregation.label, last_stats_time)
+            _LOGGER.info("Updating %s statistics since %s", aggregation.label, last_stats_time)
 
         statistics = {}
         for key, statistic_id, label, is_energy in series_specs:

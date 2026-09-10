@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional, List
@@ -13,10 +14,19 @@ from aiohttp import ClientTimeout, ClientError
 import pyotp
 
 from .const import (
+    DEFAULT_POLL_MAX_WAIT,
+    DEFAULT_POLL_WAIT,
     DEFAULT_TIMEOUT,
+    HISTORY_CHUNK_DAYS,
+    MAX_POLL_MAX_WAIT,
+    MAX_POLL_WAIT,
     MAX_RETRIES,
+    MIN_POLL_MAX_WAIT,
+    MIN_POLL_WAIT,
     RETRY_DELAY,
     SESSION_TIMEOUT,
+    SETTING_POLL_INTERVAL,
+    SETTING_POLL_MAX_RUNTIME,
     ELECTRIC_SERVICE,
     SUPPORTED_SERVICES,
     FALLBACK_SERVICES,
@@ -120,6 +130,9 @@ class SmartHubAPI:
         self.primary_username: Optional[str] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_created_at: Optional[datetime] = None
+        # Populated on first use from the provider's own settings endpoint.
+        self._poll_wait: Optional[float] = None
+        self._poll_max_wait: Optional[float] = None
 
     def parse_usage_series(self, usage_data: List[Dict], parseType: ParseType = ParseType.FORWARD) -> List[Dict]:
         parsed_data = []
@@ -524,7 +537,85 @@ class SmartHubAPI:
         except ClientError as e:
             raise SmartHubConnectionError(f"Connection error during User_data request: {e}") from e
 
-    async def get_energy_data(self, location, aggregation:Aggregation, start_datetime=None) -> Optional[Dict[str, Any]]:
+    async def get_setting(self, setting_name: str) -> Optional[Any]:
+        """
+        Read a single value from the provider's usage settings registry.
+
+        Returns None when the setting is missing or unreadable - callers fall
+        back to their own defaults rather than failing the update.
+        """
+        settings_url = f"https://{self.host}/services/secured/settings"
+        params = {
+            "settingsRegistry": "UsageSettingsRegistry",
+            "settingName": setting_name,
+        }
+
+        if not self.token:
+            await self._refresh_authentication()
+
+        headers = {
+            "Authority": self.host,
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+            "X-Nisc-Smarthub-Username": self.email,
+            "User-Agent": "HomeAssistant SmartHub Integration",
+        }
+
+        try:
+            session = await self._get_session()
+            async with session.get(settings_url, headers=headers, params=params) as response:
+                if response.status != 200:
+                    _LOGGER.debug("Setting %s unavailable (HTTP %s)", setting_name, response.status)
+                    return None
+                return await response.json(content_type=None)
+        except (ClientError, ValueError) as e:
+            _LOGGER.debug("Could not read setting %s: %s", setting_name, e)
+            return None
+
+    @staticmethod
+    def _coerce_seconds(value: Any) -> Optional[float]:
+        """
+        Interpret a settings value as a number of seconds.
+
+        The registry returns bare JSON scalars, sometimes quoted. Values large
+        enough to be implausible as seconds are treated as milliseconds.
+        """
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            return None
+        if seconds <= 0:
+            return None
+        if seconds > MAX_POLL_MAX_WAIT:
+            seconds /= 1000.0
+        return seconds
+
+    async def get_poll_settings(self) -> tuple[float, float]:
+        """
+        Return (seconds between PENDING polls, seconds to keep polling).
+
+        Read once from the provider and cached for the life of the client.
+        """
+        if self._poll_wait is not None and self._poll_max_wait is not None:
+            return self._poll_wait, self._poll_max_wait
+
+        wait = self._coerce_seconds(await self.get_setting(SETTING_POLL_INTERVAL))
+        max_wait = self._coerce_seconds(await self.get_setting(SETTING_POLL_MAX_RUNTIME))
+
+        self._poll_wait = min(max(wait or DEFAULT_POLL_WAIT, MIN_POLL_WAIT), MAX_POLL_WAIT)
+        self._poll_max_wait = min(
+            max(max_wait or DEFAULT_POLL_MAX_WAIT, MIN_POLL_MAX_WAIT), MAX_POLL_MAX_WAIT
+        )
+
+        _LOGGER.debug(
+            "Poll cadence: %.0fs between retries, up to %.0fs per request",
+            self._poll_wait, self._poll_max_wait,
+        )
+        return self._poll_wait, self._poll_max_wait
+
+    async def get_energy_data(self, location, aggregation:Aggregation, start_datetime=None, end_datetime=None) -> Optional[Dict[str, Any]]:
         """
         Retrieve energy usage data asynchronously with retry logic.
 
@@ -539,7 +630,8 @@ class SmartHubAPI:
         # Calculate startDateTime and endDateTime
         now = datetime.now()
         # Get data since specified start (or last 30 days) as of midnight yesterday
-        end_datetime = now.replace(minute=0, second=0, microsecond=0)
+        if end_datetime is None:
+          end_datetime = now.replace(minute=0, second=0, microsecond=0)
         if start_datetime is None:
           # fetch data from last period
           start_datetime = end_datetime - timedelta(days=30)
@@ -561,10 +653,17 @@ class SmartHubAPI:
 
         _LOGGER.debug("Requesting energy data from: %s", poll_url)
 
-        # Track if we've already tried refreshing the token
-        token_refreshed = False
+        # SmartHub answers with PENDING and expects the identical body to be
+        # re-posted until it returns COMPLETE. Waiting for that is separate from
+        # retrying a failed connection, so the two have their own budgets.
+        poll_wait, poll_max_wait = await self.get_poll_settings()
+        deadline = time.monotonic() + poll_max_wait
 
-        for attempt in range(1, MAX_RETRIES + 1):
+        token_refreshed = False
+        connection_attempts = 0
+        polls = 0
+
+        while True:
             try:
                 # If token is unset - refresh auth
                 if not self.token:
@@ -579,9 +678,10 @@ class SmartHubAPI:
                     "User-Agent": "HomeAssistant SmartHub Integration",
                 }
 
+                polls += 1
                 session = await self._get_session()
                 async with session.post(poll_url, headers=headers, json=data) as response:
-                    _LOGGER.debug("Attempt %d: Response status: %s", attempt, response.status)
+                    _LOGGER.debug("Poll %d: Response status: %s", polls, response.status)
 
                     if response.status == 401:
                         if not token_refreshed:
@@ -609,15 +709,17 @@ class SmartHubAPI:
                     # Check if the status is still pending
                     status = response_json.get("status")
                     if status == "PENDING":
-                        _LOGGER.debug("Attempt %d: Status is PENDING, retrying...", attempt)
-                        if attempt < MAX_RETRIES:
-                            await asyncio.sleep(RETRY_DELAY)
-                            continue
-                        else:
-                            _LOGGER.warning("Maximum retries reached, data still PENDING")
+                        if time.monotonic() + poll_wait > deadline:
+                            _LOGGER.warning(
+                                "Data still PENDING after %d polls / %.0fs, giving up",
+                                polls, poll_max_wait,
+                            )
                             return None
+                        _LOGGER.debug("Poll %d: Status is PENDING, retrying in %.0fs", polls, poll_wait)
+                        await asyncio.sleep(poll_wait)
+                        continue
                     elif status == "COMPLETE":
-                        _LOGGER.debug("Successfully retrieved energy data")
+                        _LOGGER.debug("Successfully retrieved energy data after %d polls", polls)
                         return self.parse_usage(response_json)
                     else:
                         _LOGGER.warning("Unexpected status in response: %s", status)
@@ -626,18 +728,126 @@ class SmartHubAPI:
             except SmartHubAuthenticationError:
                 # Re-raise auth errors immediately
                 raise
-            except ClientError as e:
-                if attempt < MAX_RETRIES:
+            except (ClientError, TimeoutError) as e:
+                connection_attempts += 1
+                if connection_attempts < MAX_RETRIES:
                     _LOGGER.warning(
                         "Attempt %d failed with connection error: %s, retrying...",
-                        attempt, e
+                        connection_attempts, e
                     )
                     await asyncio.sleep(RETRY_DELAY)
                     continue
-                else:
-                    raise SmartHubConnectionError(
-                        f"Connection failed after {MAX_RETRIES} attempts: {e}"
-                    ) from e
+                raise SmartHubConnectionError(
+                    f"Connection failed after {MAX_RETRIES} attempts: {e}"
+                ) from e
 
-        raise SmartHubAPIError(f"Failed to retrieve data after {MAX_RETRIES} attempts")
+    async def get_energy_data_history(
+        self,
+        location,
+        aggregation: Aggregation,
+        max_days: int,
+        chunk_days: int = HISTORY_CHUNK_DAYS,
+        end_datetime=None,
+    ) -> Dict[str, Any]:
+        """
+        Walk backwards from `end_datetime` collecting up to `max_days` of history.
+
+        SmartHub will happily return a year of hourly data in one response, but
+        the payload repeats each series about eight times, so a single request
+        for several years would cost hundreds of megabytes to parse. Requesting
+        it in chunks keeps peak memory flat: the raw response for each chunk is
+        released as soon as its readings have been extracted.
+
+        The walk stops at `max_days`, or earlier at the first chunk with no
+        readings - which is how far back the provider actually holds data. That
+        floor differs per account, so it is discovered rather than configured.
+
+        Returns:
+            The merged series, oldest reading first.
+        """
+        if end_datetime is None:
+            end_datetime = datetime.now().replace(minute=0, second=0, microsecond=0)
+
+        # Readings keyed by timestamp so overlapping chunk edges collapse instead
+        # of double counting.
+        merged: Dict[str, Dict[Any, Dict[str, Any]]] = {}
+        metadata: Dict[str, Any] = {}
+
+        chunk_end = end_datetime
+        remaining = max_days
+        chunk_number = 0
+
+        while remaining > 0:
+            span = min(chunk_days, remaining)
+            chunk_start = chunk_end - timedelta(days=span)
+            chunk_number += 1
+
+            _LOGGER.info(
+                "Importing %s history chunk %d: %s to %s",
+                aggregation.label, chunk_number, chunk_start, chunk_end,
+            )
+
+            try:
+                chunk = await self.get_energy_data(
+                    location=location,
+                    aggregation=aggregation,
+                    start_datetime=chunk_start,
+                    end_datetime=chunk_end,
+                )
+            except (SmartHubConnectionError, SmartHubDataError, TimeoutError) as e:
+                if not merged:
+                    # Nothing collected yet - let the caller treat this as a
+                    # failed update rather than an empty history.
+                    raise
+                _LOGGER.warning(
+                    "Stopping %s history import at %s after %s - keeping the "
+                    "%d reading(s) already collected",
+                    aggregation.label, chunk_end, e, len(merged.get("USAGE", {})),
+                )
+                break
+
+            if chunk is None:
+                # A timed out request is not evidence that history ran out, so
+                # keep whatever was collected but stop walking rather than
+                # silently reporting a shorter history than the provider holds.
+                _LOGGER.warning(
+                    "Gave up waiting for %s history before %s - keeping the %d "
+                    "reading(s) collected so far",
+                    aggregation.label, chunk_end, len(merged.get("USAGE", {})),
+                )
+                break
+
+            if not chunk.get("USAGE"):
+                _LOGGER.info(
+                    "No %s readings before %s - reached the start of available history",
+                    aggregation.label, chunk_end,
+                )
+                break
+
+            for key, value in chunk.items():
+                if isinstance(value, list):
+                    series = merged.setdefault(key, {})
+                    for reading in value:
+                        # Chunks are walked newest first and their edges touch.
+                        # The newer chunk starts exactly on the boundary, so it
+                        # holds the whole boundary hour, while the older chunk
+                        # only reaches part way into it. First writer wins keeps
+                        # the complete reading.
+                        series.setdefault(reading["reading_time"], reading)
+                else:
+                    # Scalar metadata such as the meter name.
+                    metadata.setdefault(key, value)
+
+            chunk_end = chunk_start
+            remaining -= span
+
+        result: Dict[str, Any] = dict(metadata)
+        for key, series in merged.items():
+            result[key] = [series[when] for when in sorted(series)]
+
+        _LOGGER.info(
+            "Imported %d %s readings across %d chunk(s)",
+            len(result.get("USAGE", [])), aggregation.label, chunk_number,
+        )
+        return result
 

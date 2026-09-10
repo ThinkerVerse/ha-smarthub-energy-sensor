@@ -10,6 +10,7 @@ from custom_components.smarthub import async_setup_entry
 from custom_components.smarthub.api import SmartHubAPI, SmartHubAPIError, SmartHubLocation
 from custom_components.smarthub.const import DOMAIN, ELECTRIC_SERVICE
 
+from custom_components.smarthub.api import Aggregation
 from custom_components.smarthub.sensor import SmartHubDataUpdateCoordinator
 from homeassistant.components.recorder import Recorder
 from homeassistant.components.recorder.models import (
@@ -51,6 +52,13 @@ def mock_smarthub_api(hass) -> Generator[AsyncMock]:
         mock_api.parse_usage = api.parse_usage
         mock_api.get_service_locations.return_value = []
         mock_api.get_energy_data.return_value = {}
+
+        # Run the real chunking logic against the mocked single-chunk fetch, so
+        # the first-run import path is genuinely exercised.
+        async def _history(**kwargs):
+            return await SmartHubAPI.get_energy_data_history(mock_api, **kwargs)
+
+        mock_api.get_energy_data_history = _history
         yield mock_api
 
 
@@ -441,6 +449,182 @@ async def test_coordinator_first_run_without_cost(
     )
     assert cost_id not in metadata
 
+
+
+async def test_coordinator_imports_multi_chunk_history(
+    recorder_mock: Recorder,
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_smarthub_api: AsyncMock,
+) -> None:
+    """First run imports far beyond one chunk, stopping at the provider's floor."""
+    from datetime import datetime, timezone as _tz
+
+    mock_smarthub_api.get_service_locations.return_value = [
+      SmartHubLocation(
+        id="11111",
+        service=ELECTRIC_SERVICE,
+        description="test location",
+        provider="test provider",
+      )
+    ]
+
+    # The provider holds nothing before this date, however far back we ask.
+    floor = datetime(2026, 1, 1, tzinfo=_tz.utc)
+    end = datetime(2026, 9, 1, tzinfo=_tz.utc)
+    windows = []
+
+    async def fake_get_energy_data(location, aggregation, start_datetime=None, end_datetime=None):
+        windows.append((start_datetime, end_datetime))
+        start = start_datetime.replace(tzinfo=_tz.utc)
+        stop = end_datetime.replace(tzinfo=_tz.utc)
+        readings = []
+        day = max(start, floor)
+        while day < stop:
+            readings.append({
+                "reading_time": day,
+                "consumption": 1.0,
+                "raw_timestamp": int(day.timestamp() * 1000),
+            })
+            day += timedelta(days=1)
+        return {"USAGE": readings} if readings else {}
+
+    mock_smarthub_api.get_energy_data = fake_get_energy_data
+
+    mock_config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        mock_config_entry, data={**mock_config_entry.data, "history_days": 3650}
+    )
+
+    coordinator = SmartHubDataUpdateCoordinator(
+        hass, api=mock_smarthub_api, update_interval=timedelta(minutes=720),
+        config_entry=mock_config_entry,
+    )
+    # The deep import is the background/service path, not the inline first run.
+    await coordinator.async_import_history(3650)
+    await async_wait_recording_done(hass)
+
+    stats = await get_instance(hass).async_add_executor_job(
+        statistics_during_period, hass, dt_util.utc_from_timestamp(0), None,
+        {"smarthub:smarthub_energy_sensor_123456_11111"}, "hour", None, {"state", "sum"},
+    )
+    rows = stats["smarthub:smarthub_energy_sensor_123456_11111"]
+
+    # Far more than the 90 days a single chunk covers, and more than the old cap.
+    assert len(rows) > 90
+    # It walked back past the floor once, found nothing, and stopped - rather
+    # than issuing all 41 chunks the 3650 day cap would allow.
+    assert len(windows) < 41
+    # Chronological with a monotonically rising running total across chunks.
+    starts = [r["start"] for r in rows]
+    assert starts == sorted(starts)
+    sums = [r["sum"] for r in rows]
+    assert sums == sorted(sums)
+    assert sums[-1] == float(len(rows))
+
+
+async def test_async_import_history_reimports_on_demand(
+    recorder_mock: Recorder,
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_smarthub_api: AsyncMock,
+) -> None:
+    """The service entry point imports history for every location."""
+    location = SmartHubLocation(
+        id="11111", service=ELECTRIC_SERVICE,
+        description="test location", provider="test provider",
+    )
+    mock_smarthub_api.get_service_locations.return_value = [location]
+
+    requested = []
+
+    async def fake_history(location, aggregation, max_days, **kwargs):
+        requested.append((aggregation, max_days))
+        return {"USAGE": []}
+
+    mock_smarthub_api.get_energy_data_history = fake_history
+    mock_smarthub_api.get_energy_data.return_value = {"USAGE": []}
+
+    coordinator = SmartHubDataUpdateCoordinator(
+        hass, api=mock_smarthub_api, update_interval=timedelta(minutes=720),
+        config_entry=mock_config_entry,
+    )
+    await coordinator.async_import_history(1200)
+
+    # Both aggregations refreshed, with the requested depth.
+    assert (Aggregation.HOURLY, 1200) in requested
+    assert (Aggregation.DAILY, 1200) in requested
+
+
+async def test_first_run_defers_deep_history_to_the_background(
+    recorder_mock: Recorder,
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_smarthub_api: AsyncMock,
+) -> None:
+    """Setup only imports the opening chunk, and flags the rest for later."""
+    location = SmartHubLocation(
+        id="11111", service=ELECTRIC_SERVICE,
+        description="test location", provider="test provider",
+    )
+    mock_smarthub_api.get_service_locations.return_value = [location]
+
+    asked = []
+
+    async def fake_history(location, aggregation, max_days, **kwargs):
+        asked.append(max_days)
+        return {"USAGE": []}
+
+    mock_smarthub_api.get_energy_data_history = fake_history
+
+    mock_config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        mock_config_entry, data={**mock_config_entry.data, "history_days": 1825}
+    )
+
+    coordinator = SmartHubDataUpdateCoordinator(
+        hass, api=mock_smarthub_api, update_interval=timedelta(minutes=720),
+        config_entry=mock_config_entry,
+    )
+    await coordinator._insert_statistics(location, Aggregation.HOURLY)
+
+    # Bounded to one chunk so config entry setup is not held up for minutes.
+    assert asked == [90]
+    assert coordinator.history_backfill_pending is True
+
+
+async def test_first_run_within_one_chunk_needs_no_backfill(
+    recorder_mock: Recorder,
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_smarthub_api: AsyncMock,
+) -> None:
+    """A shallow configured history is satisfied inline."""
+    location = SmartHubLocation(
+        id="11111", service=ELECTRIC_SERVICE,
+        description="test location", provider="test provider",
+    )
+    asked = []
+
+    async def fake_history(location, aggregation, max_days, **kwargs):
+        asked.append(max_days)
+        return {"USAGE": []}
+
+    mock_smarthub_api.get_energy_data_history = fake_history
+
+    mock_config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        mock_config_entry, data={**mock_config_entry.data, "history_days": 30}
+    )
+
+    coordinator = SmartHubDataUpdateCoordinator(
+        hass, api=mock_smarthub_api, update_interval=timedelta(minutes=720),
+        config_entry=mock_config_entry,
+    )
+    await coordinator._insert_statistics(location, Aggregation.HOURLY)
+
+    assert asked == [30]
+    assert coordinator.history_backfill_pending is False
 
 
 async def async_wait_recording_done(hass) -> None:
