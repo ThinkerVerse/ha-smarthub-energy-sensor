@@ -36,6 +36,11 @@ def mock_hass():
     """Create a mock Home Assistant instance."""
     hass = Mock(spec=HomeAssistant)
     hass.data = {}
+    # `services` is created in HomeAssistant.__init__, so it is not part of the
+    # class spec and has to be provided explicitly.
+    hass.services = Mock()
+    hass.services.has_service = Mock(return_value=False)
+    hass.services.async_register = Mock()
     return hass
 
 @pytest.fixture
@@ -246,6 +251,12 @@ async def test_async_setup_entry_success(mock_hass, mock_config_entry):
              assert result is True
              # In the new code, runtime_data is set on entry
              assert hasattr(mock_config_entry, "runtime_data")
+
+             # The historical import service is available once set up.
+             registered = [
+                 call.args[1] for call in mock_hass.services.async_register.call_args_list
+             ]
+             assert "import_history" in registered
 
 
 @pytest.mark.asyncio

@@ -59,7 +59,7 @@ config/
 
 ### Requirements
 
-Version 2.1 and higher requires Home Assistant version 2025.11 and greater.
+Version 2.1 and higher requires Home Assistant version 2025.11 and greater. CI runs the test suite against both ends of that range - 2025.11 on Python 3.13, and the current release on Python 3.14.
 
 Before setting up the integration, you'll need to gather the following information from your SmartHub portal:
 
@@ -95,12 +95,22 @@ Once configured, your SmartHub energy sensor will automatically appear in Home A
    Note: there will be multiple entries, 1 entity (monthly), and 2 Statistics (daily, hourly)- select one of the statistics which provide historical usage aligned with the your actual energy usage.
 4. The sensor will now provide data to your Energy Dashboard
 
+#### Energy Costs
+
+Some SmartHub providers return the dollar cost of each reading alongside the usage. Where they do, the integration imports it as an additional `cost` statistic that lines up hour-for-hour with the usage statistic.
+
+In the Energy dashboard, when adding your grid consumption, choose **"Use an entity with a total cost"** (rather than a static price per kWh) and select the matching SmartHub cost statistic. Your dashboard then shows the same figures your provider bills you, including any tiered or time-of-use rates that a fixed price per kWh cannot express.
+
+If your provider does not return cost data, no cost statistic is created and you can continue to set a price per kWh manually.
+
 #### Solar or Net Metering
 Different energy providers have different solar / net metering configurations. Your energy provider might provide data on how much energy you return to the grid, how much energy you consume, or a combination of both.
 
 The integration should automatically determine the appropriate option, and provide an additional "return" hourly and daily statistic.
 
 In the Energy dashboard set the Grid Consumption entry to the "usage" statistic, and the Return to Grid to the "return" statistic.
+
+Where the provider also returns cost data, a "compensation" statistic records the credit for energy you return, and can be selected as the compensation entity for your Return to Grid entry.
 
 ### Sensor Details
 
@@ -114,6 +124,30 @@ In the Energy dashboard set the Grid Consumption entry to the "usage" statistic,
 By default, the integration will poll the SmartHub API every 6 hours. You can adjust this when re-configuring the integration to between 15-1440 minutes.
 
 **Note**: SmartHub data typically updates every 15-60 minutes, so setting a very low poll interval may not provide more frequent updates but will increase API calls.
+
+### Historical Import
+
+**Days of history to import** controls how far back the integration reaches on its first run. The default is 365 days and it can be set anywhere from 1 day to 10 years.
+
+You do not need to know how much history your provider keeps. The import walks backwards in 90-day chunks and stops as soon as a chunk comes back empty, so asking for more days than exist simply ends early. Chunking also keeps memory use flat - a single multi-year request would be hundreds of megabytes to parse, which matters on a Raspberry Pi.
+
+Setup is not held up by a deep import. The first refresh fetches only the opening chunk so the integration becomes available quickly, and anything beyond that is imported by a background task straight afterwards. Watch the log for `Continuing historical import` to follow its progress.
+
+Polling cadence is taken from the provider itself (`UsagePollingRequestInterval` and `UsagePollingExecutorMaxRuntime`), falling back to 5 seconds between retries and 5 minutes per request when those are unavailable.
+
+### Re-importing history later
+
+The first-run import only happens while no statistics exist yet. To pull more history afterwards, call the `smarthub.import_history` action:
+
+```yaml
+action: smarthub.import_history
+data:
+  days: 1825   # optional, defaults to the configured value
+```
+
+⚠️ **Delete the existing SmartHub statistics first** (Developer tools → Statistics), because every reading is rewritten from a zero baseline. Home Assistant does not rebase the running totals of statistics that already exist, so importing older data underneath them leaves the totals inconsistent.
+
+Pass `entry_id` to limit the import to one account when you have several configured.
 
 ## 🛠️ Troubleshooting
 
@@ -199,6 +233,10 @@ Contributions are welcome! Please follow these guidelines:
 - Data availability depends on your energy provider's SmartHub implementation
 - Update frequency is limited by the provider's data refresh rate
 - Currently supports electricity usage only (no gas or other utilities)
+- Cost data is only available if your provider returns it; not all SmartHub deployments do
+- Statistics are hourly at finest resolution - Home Assistant does not accept sub-hourly external statistics, so any 15-minute reads your provider returns are summed into the hour
+- How far back history goes is set by your provider, not this integration; the import stops where their data stops
+- On the autumn daylight-saving changeover SmartHub reports 24 wall-clock hours for a 25-hour day, so one hour per year is missing from the imported series
 - Requires active SmartHub portal access
 
 
