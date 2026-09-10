@@ -20,9 +20,11 @@ from homeassistant.components.recorder.models import (
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     get_last_statistics,
+    get_metadata,
     statistics_during_period,
 )
 from datetime import timedelta
+from functools import partial
 from homeassistant.util import dt as dt_util
 
 
@@ -303,6 +305,141 @@ async def test_coordinator_first_run_return_meter(
     assert stats["smarthub:smarthub_energy_sensor_daily_123456_11111"][1]["sum"] == 113.0
     assert stats["smarthub:smarthub_energy_return_sensor_daily_123456_11111"][0]["sum"] == 5
     assert stats["smarthub:smarthub_energy_return_sensor_daily_123456_11111"][1]["sum"] == 6
+
+
+
+async def test_coordinator_first_run_with_cost(
+    recorder_mock: Recorder,
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_smarthub_api: AsyncMock,
+) -> None:
+    """A provider returning COST alongside USAGE gets a cost statistic."""
+    mock_smarthub_api.get_service_locations.return_value = [
+      SmartHubLocation(
+        id="11111",
+        service=ELECTRIC_SERVICE,
+        description="test location",
+        provider="test provider",
+      )
+    ]
+
+    meters = [
+        {'meterNumber': '1ND91111111', 'seriesId': '1ND91111111', 'flowDirection': 'FORWARD', 'isNetMeter': False},
+    ]
+
+    def _series(values):
+        timestamps = [1762215300000, 1762216200000, 1762217100000, 1762218900000]
+        return [
+            {
+                "meterNumber": "1ND91111111", "name": "1ND91111111",
+                "data": [{"x": x, "y": y} for x, y in zip(timestamps, values)],
+            },
+        ]
+
+    test_data = {
+        "data": {
+            "ELECTRIC": [
+                {"type": "USAGE", "meters": meters, "series": _series([1, 10, 100, 1])},
+                # Cost for the same readings, at a flat 10 cents per unit.
+                {"type": "COST", "meters": meters, "series": _series([0.1, 1.0, 10.0, 0.1])},
+            ]
+        }
+    }
+
+    mock_smarthub_api.get_energy_data.return_value = mock_smarthub_api.parse_usage(test_data)
+
+    coordinator = SmartHubDataUpdateCoordinator(hass, api=mock_smarthub_api, update_interval=timedelta(minutes=720), config_entry=mock_config_entry)
+
+    await coordinator._async_update_data()
+
+    await async_wait_recording_done(hass)
+
+    consumption_id = "smarthub:smarthub_energy_sensor_daily_123456_11111"
+    cost_id = "smarthub:smarthub_energy_cost_daily_123456_11111"
+
+    stats = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        dt_util.utc_from_timestamp(0),
+        None,
+        {consumption_id, cost_id},
+        "hour",
+        None,
+        {"state", "sum"},
+    )
+
+    # Cost tracks consumption one-for-one, so the two series must have the same
+    # number of points at the same times.
+    assert len(stats[cost_id]) == len(stats[consumption_id])
+    assert [row["start"] for row in stats[cost_id]] == [
+        row["start"] for row in stats[consumption_id]
+    ]
+
+    # The sub-hour readings are consolidated the same way usage is.
+    assert stats[consumption_id][0]["sum"] == 111.0
+    assert stats[cost_id][0]["sum"] == pytest.approx(11.1)
+    assert stats[cost_id][1]["sum"] == pytest.approx(11.2)
+
+    # Cost statistics are stored without a unit so the Energy dashboard renders
+    # them in the currency configured in Home Assistant.
+    metadata = await get_instance(hass).async_add_executor_job(
+        partial(get_metadata, hass, statistic_ids={cost_id})
+    )
+    assert metadata[cost_id][1]["unit_of_measurement"] is None
+
+
+async def test_coordinator_first_run_without_cost(
+    recorder_mock: Recorder,
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_smarthub_api: AsyncMock,
+) -> None:
+    """A provider returning no COST entry gets no cost statistic."""
+    mock_smarthub_api.get_service_locations.return_value = [
+      SmartHubLocation(
+        id="11111",
+        service=ELECTRIC_SERVICE,
+        description="test location",
+        provider="test provider",
+      )
+    ]
+
+    test_data = {
+        "data": {
+            "ELECTRIC": [
+                {
+                    "type": "USAGE",
+                    "meters": [
+                     {'meterNumber': '1ND91111111', 'seriesId': '1ND91111111', 'flowDirection': 'FORWARD', 'isNetMeter': False},
+                    ],
+                    "series": [
+                        {
+                            "meterNumber": "1ND91111111", "name": "1ND91111111",
+                            "data": [
+                                {"x": 1762215300000, "y":   1},
+                                {"x": 1762218900000, "y":   1},
+                            ]
+                        },
+                    ]
+                }
+            ]
+        }
+    }
+
+    mock_smarthub_api.get_energy_data.return_value = mock_smarthub_api.parse_usage(test_data)
+
+    coordinator = SmartHubDataUpdateCoordinator(hass, api=mock_smarthub_api, update_interval=timedelta(minutes=720), config_entry=mock_config_entry)
+
+    await coordinator._async_update_data()
+
+    await async_wait_recording_done(hass)
+
+    cost_id = "smarthub:smarthub_energy_cost_daily_123456_11111"
+    metadata = await get_instance(hass).async_add_executor_job(
+        partial(get_metadata, hass, statistic_ids={cost_id})
+    )
+    assert cost_id not in metadata
 
 
 
